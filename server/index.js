@@ -5,6 +5,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createClient } from '@supabase/supabase-js';
 import { EVENTS } from '../src/data.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -12,32 +13,35 @@ const ROOT = path.join(__dirname, '..');
 
 const PORT = Number(process.env.PORT || 3001);
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY;
 
 if (!ADMIN_PASSWORD) {
   throw new Error('ADMIN_PASSWORD is missing. Configure it in .env.');
 }
 
-const STORE_FILE = path.join(__dirname, 'roulette-data.json');
+if (!SUPABASE_URL || !SUPABASE_SECRET_KEY) {
+  throw new Error(
+    'SUPABASE_URL and SUPABASE_SECRET_KEY must be configured in .env.'
+  );
+}
+
+const supabase = createClient(
+  SUPABASE_URL,
+  SUPABASE_SECRET_KEY,
+  {
+    auth: {
+      autoRefreshToken: false,
+      persistSession: false
+    }
+  }
+);
 
 const app = express();
 app.use(express.json());
 
-// JSON storage replaces the native SQLite dependency.
-let store = { spins: [], assistance: [] };
-
-if (fs.existsSync(STORE_FILE)) {
-  store = JSON.parse(fs.readFileSync(STORE_FILE, 'utf8'));
-  store.spins ??= [];
-  store.assistance ??= [];
-}
-
-function saveStore() {
-  const temporaryFile = `${STORE_FILE}.tmp`;
-  fs.writeFileSync(temporaryFile, JSON.stringify(store, null, 2));
-  fs.renameSync(temporaryFile, STORE_FILE);
-}
-
-const normTeam = value => String(value || '').trim().toUpperCase();
+const normTeam = value =>
+  String(value || '').trim().toUpperCase();
 
 const validTeam = team =>
   /^[A-Z0-9-]{2,20}$/.test(team);
@@ -79,38 +83,38 @@ function check(req, res) {
   return { teamId, event };
 }
 
-function findSpin(teamId, event) {
-  return store.spins.find(
-    row => row.team_id === teamId && row.event === event
-  );
+function handleDatabaseError(res, error) {
+  console.error('Database operation failed:', error.message);
+
+  return res.status(500).json({
+    error: 'A database operation failed. Please try again.'
+  });
 }
 
 // Check whether a team has already spun for this event.
-app.get('/api/spin', (req, res) => {
+app.get('/api/spin', async (req, res) => {
   const key = check(req, res);
   if (!key) return;
 
-  const row = findSpin(key.teamId, key.event);
+  const { data, error } = await supabase
+    .from('spins')
+    .select('*')
+    .eq('team_id', key.teamId)
+    .eq('event', key.event)
+    .maybeSingle();
+
+  if (error) return handleDatabaseError(res, error);
 
   res.json({
-    used: Boolean(row),
-    result: toResult(row)
+    used: Boolean(data),
+    result: toResult(data)
   });
 });
 
 // One spin per team per event.
-app.post('/api/spin', (req, res) => {
+app.post('/api/spin', async (req, res) => {
   const key = check(req, res);
   if (!key) return;
-
-  const existing = findSpin(key.teamId, key.event);
-
-  if (existing) {
-    return res.status(409).json({
-      error: 'This team has already spun for this event.',
-      result: toResult(existing)
-    });
-  }
 
   const challenges = EVENTS[key.event].challenges;
 
@@ -123,35 +127,60 @@ app.post('/api/spin', (req, res) => {
   const row = {
     team_id: key.teamId,
     event: key.event,
-    challenge_index: crypto.randomInt(challenges.length),
-    created_at: new Date().toISOString()
+    challenge_index: crypto.randomInt(challenges.length)
   };
 
-  store.spins.push(row);
-  saveStore();
+  const { data, error } = await supabase
+    .from('spins')
+    .insert(row)
+    .select()
+    .single();
+
+  if (error) {
+    // Another request may have recorded this team's spin first.
+    if (error.code === '23505') {
+      const existing = await supabase
+        .from('spins')
+        .select('*')
+        .eq('team_id', key.teamId)
+        .eq('event', key.event)
+        .maybeSingle();
+
+      if (existing.error) {
+        return handleDatabaseError(res, existing.error);
+      }
+
+      return res.status(409).json({
+        error: 'This team has already spun for this event.',
+        result: toResult(existing.data)
+      });
+    }
+
+    return handleDatabaseError(res, error);
+  }
 
   res.json({
     used: true,
-    result: toResult(row)
+    result: toResult(data)
   });
 });
 
 // Submit a request for organizer assistance.
-app.post('/api/assistance', (req, res) => {
+app.post('/api/assistance', async (req, res) => {
   const key = check(req, res);
   if (!key) return;
 
-  const request = {
-    id: crypto.randomUUID(),
-    team_id: key.teamId,
-    event: key.event,
-    message: String(req.body?.message || '').slice(0, 500),
-    resolved: 0,
-    created_at: new Date().toISOString()
-  };
+  const message = String(req.body?.message || '').slice(0, 500);
 
-  store.assistance.push(request);
-  saveStore();
+  const { error } = await supabase
+    .from('assistance')
+    .insert({
+      team_id: key.teamId,
+      event: key.event,
+      message
+    });
+
+  if (error) return handleDatabaseError(res, error);
 
   res.json({ ok: true });
 });
@@ -161,6 +190,7 @@ function admin(req, res, next) {
   const given = Buffer.from(
     String(req.get('x-admin-password') || '')
   );
+
   const real = Buffer.from(ADMIN_PASSWORD);
 
   if (
@@ -175,52 +205,81 @@ function admin(req, res, next) {
   next();
 }
 
-app.get('/api/admin/overview', admin, (_req, res) => {
-  res.json({
-    spins: [...store.spins]
-      .sort((a, b) =>
-        b.created_at.localeCompare(a.created_at)
-      )
-      .map(toResult),
+app.get('/api/admin/overview', admin, async (_req, res) => {
+  const [spinsResult, assistanceResult] = await Promise.all([
+    supabase
+      .from('spins')
+      .select('*')
+      .order('created_at', { ascending: false }),
 
-    requests: [...store.assistance].sort(
-      (a, b) =>
-        a.resolved - b.resolved ||
-        b.created_at.localeCompare(a.created_at)
-    )
+    supabase
+      .from('assistance')
+      .select('*')
+      .order('resolved', { ascending: true })
+      .order('created_at', { ascending: false })
+  ]);
+
+  if (spinsResult.error) {
+    return handleDatabaseError(res, spinsResult.error);
+  }
+
+  if (assistanceResult.error) {
+    return handleDatabaseError(res, assistanceResult.error);
+  }
+
+  res.json({
+    spins: (spinsResult.data || []).map(toResult),
+    requests: (assistanceResult.data || []).map(item => ({
+      ...item,
+      resolved: item.resolved ? 1 : 0
+    }))
   });
 });
 
-app.post('/api/admin/reset', admin, (req, res) => {
+// Reset one team's spin for one event.
+app.post('/api/admin/reset', admin, async (req, res) => {
   const key = check(req, res);
   if (!key) return;
 
-  const before = store.spins.length;
+  const { data, error } = await supabase
+    .from('spins')
+    .delete()
+    .eq('team_id', key.teamId)
+    .eq('event', key.event)
+    .select('team_id');
 
-  store.spins = store.spins.filter(
-    row =>
-      !(row.team_id === key.teamId && row.event === key.event)
-  );
+  if (error) return handleDatabaseError(res, error);
 
-  const removed = before - store.spins.length;
-  saveStore();
-
-  res.json({ ok: true, removed });
+  res.json({
+    ok: true,
+    removed: data.length
+  });
 });
 
-app.post('/api/admin/resolve', admin, (req, res) => {
-  const request = store.assistance.find(
-    item => item.id === req.body?.id
-  );
+// Mark an assistance request as resolved.
+app.post('/api/admin/resolve', admin, async (req, res) => {
+  const id = req.body?.id;
 
-  if (!request) {
+  if (typeof id !== 'string' || !id) {
+    return res.status(400).json({
+      error: 'A valid assistance request ID is required.'
+    });
+  }
+
+  const { data, error } = await supabase
+    .from('assistance')
+    .update({ resolved: true })
+    .eq('id', id)
+    .select('id')
+    .maybeSingle();
+
+  if (error) return handleDatabaseError(res, error);
+
+  if (!data) {
     return res.status(404).json({
       error: 'Assistance request not found.'
     });
   }
-
-  request.resolved = 1;
-  saveStore();
 
   res.json({ ok: true });
 });
@@ -236,6 +295,12 @@ if (fs.existsSync(dist)) {
   });
 }
 
-app.listen(PORT, () => {
-  console.log(`IKARUS server running at http://localhost:${PORT}`);
-});
+// Run the Express server locally.
+// Vercel imports the app as a serverless function.
+if (!process.env.VERCEL) {
+  app.listen(PORT, () => {
+    console.log(`IKARUS server running at http://localhost:${PORT}`);
+  });
+}
+
+export default app;
